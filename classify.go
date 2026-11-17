@@ -60,65 +60,68 @@ func repoName(r *Repo) string {
 func classifyBranch(r *Repo, b *Branch, keep keepList) Verdict {
 	w := b.Worktree
 	if keep.branch(r, b.Name) || (w != nil && keep.path(w.Path)) {
-		return Verdict{Keep, "in your keep list"}
+		return Verdict{Keep, "keep_list", "in your keep list"}
 	}
 	if keep.isLongLived(b.Name) {
-		return Verdict{Keep, "long-lived branch"}
+		return Verdict{Keep, "long_lived", "long-lived branch"}
 	}
 	if b.PR != nil && b.PR.State == "OPEN" {
-		return Verdict{Keep, fmt.Sprintf("open PR #%d", b.PR.Number)}
+		return Verdict{Keep, "open_pr", fmt.Sprintf("open PR #%d", b.PR.Number)}
 	}
-	done, why := branchDone(r, b)
+	done, code, why := branchDone(r, b)
 	if glob, ok := keep.disposable(r, b.Name); ok && !done {
-		done, why = true, "throwaway branch ("+glob+" in your keep file), "+why
+		done, code, why = true, "throwaway", "throwaway branch ("+glob+" in your keep file), "+why
 	}
 	if w != nil {
 		switch {
 		case w.Main && done:
-			return Verdict{Review, "main checkout is on a finished branch (" + why + "), switch it to " + r.DefaultName + " first"}
+			return Verdict{Review, "main_checkout_finished", "main checkout is on a finished branch (" + why + "), switch it to " + r.DefaultName + " first"}
 		case w.Main:
-			return Verdict{Keep, "main checkout"}
+			return Verdict{Keep, "main_checkout", "main checkout"}
 		case w.Dirty != 0:
-			return Verdict{Keep, fmt.Sprintf("worktree has %s", plural(w.Dirty, "uncommitted change"))}
+			return Verdict{Keep, "uncommitted_changes", fmt.Sprintf("worktree has %s", plural(w.Dirty, "uncommitted change"))}
+		case w.SubmoduleWork != "":
+			return Verdict{Keep, "submodule_work", "submodule " + w.SubmoduleWork}
 		case len(w.InUse) > 0:
-			return Verdict{Keep, "worktree is open in " + strings.Join(w.InUse, ", ")}
+			return Verdict{Keep, "in_use", "worktree is open in " + strings.Join(w.InUse, ", ")}
 		case done && len(w.Ignored) > 0:
-			return Verdict{Review, why + ", but removing the worktree deletes ignored " + describeIgnored(w.Ignored)}
+			return Verdict{Review, "ignored_files", why + ", but removing the worktree deletes ignored " + describeIgnored(w.Ignored)}
 		}
 	}
 	if done {
-		return Verdict{Safe, why}
+		return Verdict{Safe, code, why}
 	}
-	return Verdict{Keep, why}
+	return Verdict{Keep, code, why}
 }
 
-// branchDone reports whether everything on the branch already lives somewhere that outlasts it, and why.
-func branchDone(r *Repo, b *Branch) (bool, string) {
+// branchDone reports whether everything on the branch already lives somewhere that outlasts it,
+// and why, as a reason code and a sentence.
+func branchDone(r *Repo, b *Branch) (done bool, code, why string) {
 	if p := b.PR; p != nil {
 		switch {
 		case p.State == "MERGED" && b.BeyondPR < 0:
-			return false, fmt.Sprintf("merged PR #%d, but its head couldn't be compared", p.Number)
+			return false, "merged_pr_head_unknown", fmt.Sprintf("merged PR #%d, but its head couldn't be compared", p.Number)
 		case p.State == "MERGED" && b.BeyondPR > 0:
-			return false, fmt.Sprintf("%s beyond merged PR #%d", plural(b.BeyondPR, "commit"), p.Number)
+			return false, "commits_beyond_merged_pr", fmt.Sprintf("%s beyond merged PR #%d", plural(b.BeyondPR, "commit"), p.Number)
 		case p.State == "MERGED" && b.Stack != "":
-			return false, b.Stack
+			return false, "stack_not_in_default", b.Stack
 		case p.State == "MERGED":
-			return true, fmt.Sprintf("merged PR #%d", p.Number)
+			return true, "merged_pr", fmt.Sprintf("merged PR #%d", p.Number)
 		case p.State == "CLOSED" && b.BeyondPR == 0:
-			return true, fmt.Sprintf("closed PR #%d, GitHub keeps its commits", p.Number)
+			return true, "closed_pr", fmt.Sprintf("closed PR #%d, GitHub keeps its commits", p.Number)
 		case p.State == "CLOSED":
-			return false, fmt.Sprintf("closed PR #%d, with %s not in it", p.Number, plural(b.BeyondPR, "commit"))
+			return false, "closed_pr_extra_commits", fmt.Sprintf("closed PR #%d, with %s not in it", p.Number, plural(b.BeyondPR, "commit"))
 		}
 	}
 	switch {
 	case b.InDefault:
-		return true, "already in " + r.DefaultName
+		return true, "in_default", "already in " + r.DefaultName
 	case b.NotOnRemote > 0:
-		return false, fmt.Sprintf("no PR, %s only on this machine", plural(b.NotOnRemote, "commit"))
+		return false, "local_only_commits", fmt.Sprintf("no PR, %s only on this machine", plural(b.NotOnRemote, "commit"))
 	case b.SameContent:
-		return false, "no PR, its changes look squash-merged into " + r.DefaultName
+		return false, "squash_merged", "no PR, its changes look squash-merged into " + r.DefaultName
 	default:
-		return false, "no PR, pushed but not merged"
+		return false, "pushed_not_merged", "no PR, pushed but not merged"
 	}
 }
 
@@ -126,19 +129,21 @@ func branchDone(r *Repo, b *Branch) (bool, string) {
 func classifyDetached(r *Repo, w *Worktree, keep keepList) Verdict {
 	switch {
 	case keep.path(w.Path):
-		return Verdict{Keep, "in your keep list"}
+		return Verdict{Keep, "keep_list", "in your keep list"}
 	case w.Dirty != 0:
-		return Verdict{Keep, fmt.Sprintf("%s", plural(w.Dirty, "uncommitted change"))}
+		return Verdict{Keep, "uncommitted_changes", plural(w.Dirty, "uncommitted change")}
+	case w.SubmoduleWork != "":
+		return Verdict{Keep, "submodule_work", "submodule " + w.SubmoduleWork}
 	case len(w.InUse) > 0:
-		return Verdict{Keep, "open in " + strings.Join(w.InUse, ", ")}
+		return Verdict{Keep, "in_use", "open in " + strings.Join(w.InUse, ", ")}
 	case (w.HeadInDefault || w.HeadOnRemote) && len(w.Ignored) > 0:
-		return Verdict{Review, "detached on a saved commit, but removing it deletes ignored " + describeIgnored(w.Ignored)}
+		return Verdict{Review, "ignored_files", "detached on a saved commit, but removing it deletes ignored " + describeIgnored(w.Ignored)}
 	case w.HeadInDefault:
-		return Verdict{Safe, "detached on a commit already in " + r.DefaultName}
+		return Verdict{Safe, "detached_in_default", "detached on a commit already in " + r.DefaultName}
 	case w.HeadOnRemote:
-		return Verdict{Safe, "detached on a commit that's on a remote branch"}
+		return Verdict{Safe, "detached_on_remote", "detached on a commit that's on a remote branch"}
 	default:
-		return Verdict{Keep, "detached on a commit that's only on this machine"}
+		return Verdict{Keep, "detached_local_only", "detached on a commit that's only on this machine"}
 	}
 }
 
@@ -169,7 +174,7 @@ func keepNested(repos []*Repo) {
 			}
 			for _, p := range parents {
 				if p != w && p.Verdict.Action != Safe && strings.HasPrefix(w.Path, p.Path+"/") {
-					w.Verdict = Verdict{Keep, "inside worktree " + p.Path + ", which is kept"}
+					w.Verdict = Verdict{Keep, "nested_in_kept_worktree", "inside worktree " + p.Path + ", which is kept"}
 				}
 			}
 		}
@@ -183,9 +188,9 @@ func classify(r *Repo, keep keepList) {
 	for _, w := range r.Worktrees {
 		switch {
 		case w.Prunable:
-			w.Verdict = Verdict{Safe, "folder is gone, prune the entry"}
+			w.Verdict = Verdict{Safe, "stale_worktree", "folder is gone, prune the entry"}
 		case w.Main:
-			w.Verdict = Verdict{Keep, "main checkout"}
+			w.Verdict = Verdict{Keep, "main_checkout", "main checkout"}
 		case w.Branch == "":
 			w.Verdict = classifyDetached(r, w, keep)
 		default:
@@ -195,13 +200,13 @@ func classify(r *Repo, keep keepList) {
 				}
 			}
 			if w.Verdict.Action == "" {
-				w.Verdict = Verdict{Keep, "on the default branch"}
+				w.Verdict = Verdict{Keep, "default_branch", "on the default branch"}
 			}
 		}
 	}
 }
 
-var irregular = map[string]string{"branch": "branches", "stash": "stashes", "stale entry": "stale entries"}
+var irregular = map[string]string{"branch": "branches", "stash": "stashes", "stale entry": "stale entries", "worktree entry": "worktree entries", "repository": "repositories"}
 
 func plural(n int, word string) string {
 	if n == 1 {

@@ -27,6 +27,8 @@ type Worktree struct {
 	InUse    []string `json:"inUse,omitempty"` // commands whose working directory is inside the worktree
 	// ignored files git would delete with the worktree that can't be rebuilt, such as .env or notes
 	Ignored []string `json:"ignored,omitempty"`
+	// work inside its submodules that git status doesn't show and removal would delete
+	SubmoduleWork string `json:"submoduleWork,omitempty"`
 	// for a detached worktree: whether its commit is already in the default branch or on a remote branch
 	HeadInDefault bool    `json:"headInDefault"`
 	HeadOnRemote  bool    `json:"headOnRemote"`
@@ -69,7 +71,10 @@ const (
 	Keep   Action = "keep"
 )
 
+// Verdict is what to do with a branch or worktree. Code is a stable snake_case reason for scripts
+// and agents (listed in AGENTS.md); Reason says the same for a person.
 type Verdict struct {
 	Action Action `json:"action"`
+	Code   string `json:"code"`
 	Reason string `json:"reason"`
 }

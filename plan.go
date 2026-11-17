@@ -43,8 +43,8 @@ func repoOf(r *Repo) plannedRepo {
 	return plannedRepo{GitDir: r.GitDir, Slug: r.Slug, MainPath: r.Worktrees[0].Path}
 }
 
-func savePlan(path, root string, p plan) error {
-	sp := savedPlan{Created: time.Now(), Root: root}
+func savePlan(path, root string, created time.Time, p plan) error {
+	sp := savedPlan{Created: created, Root: root}
 	for _, it := range p.worktrees {
 		w := plannedWT{plannedRepo: repoOf(it.repo), Path: it.wt.Path, Branch: it.wt.Branch, Head: it.wt.Head}
 		if it.branch != nil {
@@ -58,14 +58,17 @@ func savePlan(path, root string, p plan) error {
 	for _, it := range p.prune {
 		sp.Prune = append(sp.Prune, repoOf(it.repo))
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
 	b, err := json.MarshalIndent(sp, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o644)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		return err
+	}
+	return os.Chmod(path, 0o600) // WriteFile keeps the mode of a plan an older version wrote
 }
 
 // loadPlan reads a saved plan and refuses one older than maxAge, since the person reviewed a world that has moved on.
@@ -73,16 +76,16 @@ func loadPlan(path string, maxAge time.Duration) (savedPlan, plan, error) {
 	var sp savedPlan
 	b, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
-		return sp, plan{}, fmt.Errorf("no saved plan at %s: run git-mop first and review its report", path)
+		return sp, plan{}, &cliError{"plan_missing", fmt.Sprintf("no saved plan at %s: run git-mop first and review its report", path)}
 	}
 	if err != nil {
 		return sp, plan{}, err
 	}
 	if err := json.Unmarshal(b, &sp); err != nil {
-		return sp, plan{}, fmt.Errorf("%s: %v", path, err)
+		return sp, plan{}, &cliError{"plan_invalid", fmt.Sprintf("%s: %v", path, err)}
 	}
 	if age := time.Since(sp.Created); maxAge > 0 && age > maxAge {
-		return sp, plan{}, fmt.Errorf("the saved plan is %s old: run git-mop again and review the new report", age.Round(time.Minute))
+		return sp, plan{}, &cliError{"plan_expired", fmt.Sprintf("the saved plan is %s old: run git-mop again and review the new report", age.Round(time.Minute))}
 	}
 	repos := map[string]*Repo{}
 	repo := func(pr plannedRepo) *Repo {

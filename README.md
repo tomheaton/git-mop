@@ -19,37 +19,55 @@ It looks under `~/Developer` by default. Pass `--root` to search somewhere else.
 ```bash
 git-mop                       # report on ~/Developer and save the plan
 git-mop --root ~/code         # report on another folder
-git-mop apply                 # remove what that report listed under SAFE TO REMOVE
+git-mop apply                 # remove what that report listed under TO REMOVE
 git-mop sync --dry-run        # show which branches would fast-forward
 git-mop sync                  # fetch, then fast-forward them
 git-mop where fix/login       # which worktree has it checked out
 cd "$(git-mop where fix/login --repo api --path)"
 ```
 
-A report looks like this:
+A report looks like this. In a terminal it's in colour: green for what goes, yellow for what needs you, red for what you should know about.
 
 ```
-git-mop: 1 repos under ~/Developer
+git-mop  3 repositories in ~/Developer
 
-SAFE TO REMOVE  (git-mop apply)
+  ✓ 4 to remove · 3M    ? 2 to review    ! 2 to know about    · 3 kept
 
-  Worktrees: 1, 8K by du (pnpm installs share files, so less is freed)
-    api-fix-login  fix/login  already in main  8K
+TO REMOVE  git-mop apply removes these
+  ✓  api   branch    old/spike                   already in main
+  ✓  docs  worktree  typo       docs-typo    3M  already in main
+  ✓  web   branch    hotfix                      already in main
+  ✓        stale                web-release      1 worktree entry whose folder is gone
 
-  Branches with no worktree: 1
-    api  old/spike  already in main
+TO REVIEW  apply leaves these for you to decide
+  ?  api  fix/login   api-fix-login  already in main, but removing the worktree deletes ignored blob.bin
+  ?  web  chore/deps  web-deps       already in main, but removing the worktree deletes ignored .env
 
-NEEDS ATTENTION  (never changed)
-  api  1 stash
-  api  1 branch with commits only on this machine
+TO KNOW ABOUT  git-mop never changes these
+  !  api  1 stash
+  !       feat/billing: 1 commit only on this machine
 
-KEPT: 2
-     1  no PR, commit only on this machine
-     1  worktree has uncommitted change
-  (-v lists them)
+KEPT  3
+  1  no PR, commit only on this machine
+  1  no PR, pushed but not merged
+  1  worktree has uncommitted change
+  -v lists each one
 
-nothing removed: run git-mop apply to remove the items under SAFE TO REMOVE
+Nothing was removed. Run git-mop apply to remove the 4 items marked ✓. The plan expires Wed 12:37.
 ```
+
+Colour is on only when writing to a terminal. `NO_COLOR` turns it off and `FORCE_COLOR` turns it on.
+
+## For scripts and agents
+
+Every command takes `--json` and then prints exactly one JSON document on stdout, errors included, with a `schemaVersion`, `ok`, and a stable snake_case `code` on every decision, skip and error. Exit codes are 0 for success, 1 for failure, 2 for bad arguments, and 3 when `where` finds no worktree.
+
+```bash
+git-mop --json                             # every item with an id, action and reason code
+git-mop apply --only '<id>,<id>' --json    # remove only the items an agent picked
+```
+
+[AGENTS.md](AGENTS.md) documents each document, field and code.
 
 ## What counts as safe
 
@@ -61,7 +79,9 @@ A branch is safe when every commit on it lives somewhere that outlasts it:
 
 A merged PR in a stack only counts when it reached the default branch. If it merged into its base after that base had merged, the default branch must have its own `(#N)` commit for it.
 
-A worktree is safe when its branch is, it has no uncommitted changes, no process has its working directory inside it, it holds no ignored files that would be lost, and it isn't inside a linked worktree that stays.
+A worktree is safe when its branch is, it has no uncommitted changes, no process has its working directory inside it, it holds no ignored files that would be lost, and it isn't inside a linked worktree that stays. Uncommitted changes include untracked files and changes inside submodules, even when your git config hides them from `git status` (`status.showUntrackedFiles`, `diff.ignoreSubmodules`).
+
+Removing a linked worktree also deletes its submodules' repositories, which git keeps inside the worktree's own git folder. So a worktree with submodules is only safe when none of them holds commits that aren't on a remote branch, stashes, or ignored files that would be lost.
 
 Removing a worktree deletes its ignored files too, and `git status` doesn't show them. Anything that an install or build recreates (`node_modules`, `dist`, `.next`, caches, `.husky/_` and the like) doesn't count. Anything else, such as `.env` or `.claude/notes/`, moves the worktree to review with the files named. Mark files that are fine to lose with `ignorable` in the keep list. A detached worktree is safe when its commit is in the default branch or on a remote branch.
 
@@ -86,11 +106,17 @@ longlived next
 
 ## Applying
 
-Each scan saves what it offered to `~/.local/state/git-mop/plan.json`. `git-mop apply` removes only the items in that plan, so nothing that became safe after you read the report goes without you seeing it. It refuses a plan older than 24 hours (`--max-age`), and a plan is used once.
+Each scan saves what it offered to `~/.local/state/git-mop/plan.json`. `git-mop apply` removes only the items in that plan, so nothing that became safe after you read the report goes without you seeing it. It refuses a plan older than 24 hours (`--max-age`), and a plan is used once. `--only` takes item ids from `git-mop --json` and removes just those, leaving the plan in place for the rest.
 
 It checks each item again just before removing it and skips anything whose HEAD moved, branch changed, or that gained changes, ignored files or a process since the scan. Every removal goes to `~/.local/state/git-mop/removed.log` with its SHA, so a branch comes back with `git branch <name> <sha>`.
 
+A branch is deleted only if it still points at the commit the scan judged. The plan and the log are readable only by you.
+
 It never deletes whole clones, stashes, or anything with uncommitted changes.
+
+## How it runs git
+
+It runs git in every repository under the root, so it turns off the programs a repository's own config can name: hooks and `core.fsmonitor`. That also means `sync` runs no `post-merge` hooks when it fast-forwards a checked-out branch. Fetches never prompt: they use `ssh -o BatchMode=yes`, which takes the place of any `core.sshCommand`, and a remote that needs a password fails instead of waiting.
 
 ## Syncing
 
@@ -98,19 +124,19 @@ It never deletes whole clones, stashes, or anything with uncommitted changes.
 
 ## Finding a branch
 
-`where <branch>` lists every worktree with the branch checked out and whether it's clean, plus repositories where the branch exists without a worktree. It takes a glob (`'fix/*'`), `--repo` to pick a repository and `--path` to print paths only. It exits 1 when no worktree has the branch.
+`where <branch>` lists every worktree with the branch checked out and whether it's clean, plus repositories where the branch exists without a worktree. It takes a glob (`'fix/*'`), `--repo` to pick a repository and `--path` to print paths only. It exits 3 when no worktree has the branch.
 
 ## Flags
 
 Scan: `--root`, `--depth`, `--jobs`, `--no-fetch`, `--no-github`, `--no-sizes`, `--json`, `-v` (list kept items), `--keep`, `--plan`.
 
-Apply: `--plan`, `--max-age`, `--keep`, `--log`, `--json`.
+Apply: `--plan`, `--max-age`, `--keep`, `--log`, `--only`, `--json`.
 
 Sync: `--root`, `--depth`, `--jobs`, `--no-fetch`, `--dry-run`, `--include-open`, `--json`.
 
 Where: `--root`, `--depth`, `--repo`, `--path`, `--json`.
 
-Every command takes `--json` for scripts and agents, and `-h` for its flags.
+Every command takes `--json` for scripts and agents (see [AGENTS.md](AGENTS.md)), and `-h` for its flags.
 
 ## Development
 
@@ -118,6 +144,8 @@ Every command takes `--json` for scripts and agents, and `-h` for its flags.
 go build -o git-mop .
 go test ./...
 ```
+
+[AGENTS.md](AGENTS.md) covers the code layout and the rules for changes.
 
 ## License
 

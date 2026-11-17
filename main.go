@@ -1,11 +1,13 @@
 // git-mop finds every git repository under a folder and reports which worktrees and branches
 // can be removed without losing work, and which need attention. git-mop apply removes what the
 // last report offered, sync fast-forwards branches that are only behind, and where finds a branch.
+//
+// Every command takes --json, which prints one JSON document on stdout, errors included.
+// AGENTS.md describes the documents and their reason codes.
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -16,13 +18,15 @@ import (
 	"time"
 )
 
-const usage = `usage:
+const usage = `git-mop: find the git worktrees and branches you're done with, and remove them safely
+
+usage:
   git-mop [flags]                 report what can go, and save it as the plan to apply
   git-mop apply [flags]           remove what the saved plan lists, re-checking each item
   git-mop sync [flags]            fetch, then fast-forward branches that are only behind
   git-mop where <branch> [flags]  list the worktrees that have a branch (or glob) checked out
 
-run any command with -h for its flags
+every command takes --json for one JSON document on stdout, and -h for its flags
 `
 
 var home, _ = os.UserHomeDir()
@@ -41,29 +45,67 @@ func main() {
 		cmd, args = args[0], args[1:]
 	}
 	switch cmd {
-	case "":
+	case "", "scan":
+		command = "scan"
 		scanCmd(args)
 	case "apply":
+		command = "apply"
 		applyCmd(args)
 	case "sync":
+		command = "sync"
 		syncCmd(args)
 	case "where":
+		command = "where"
 		whereCmd(args)
 	case "help":
 		fmt.Print(usage)
 	default:
-		fmt.Fprintf(os.Stderr, "git-mop: unknown command %q\n\n%s", cmd, usage)
-		os.Exit(2)
+		command = cmd
+		jsonMode = wantsJSON(args)
+		exitWith(exitUsage, &cliError{"unknown_command", fmt.Sprintf("unknown command %q, run git-mop help", cmd)})
 	}
 }
 
 func newFlags(name string) *flag.FlagSet {
-	fs := flag.NewFlagSet("git-mop "+name, flag.ExitOnError)
-	fs.Usage = func() {
-		fmt.Fprint(fs.Output(), usage+"\nflags for "+fs.Name()+":\n")
-		fs.PrintDefaults()
-	}
+	fs := flag.NewFlagSet(strings.TrimSpace("git-mop "+name), flag.ContinueOnError)
+	// the flag package prints usage on any error; parse reports errors itself, as JSON when asked
+	fs.SetOutput(io.Discard)
+	fs.Usage = func() {}
 	return fs
+}
+
+// wantsJSON spots --json before the flags are parsed, so even a bad flag gets a JSON error.
+func wantsJSON(args []string) bool {
+	for _, a := range args {
+		switch a {
+		case "-json", "--json", "-json=true", "--json=true":
+			return true
+		}
+	}
+	return false
+}
+
+// parse parses flags, and with interleaved set lets them follow positional arguments,
+// as in "where fix/login --repo api". It returns the positional arguments.
+func parse(fs *flag.FlagSet, args []string, interleaved bool) []string {
+	jsonMode = wantsJSON(args)
+	var pos []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			if errors.Is(err, flag.ErrHelp) {
+				fmt.Print(usage + "\nflags for " + fs.Name() + ":\n")
+				fs.SetOutput(os.Stdout)
+				fs.PrintDefaults()
+				os.Exit(exitOK)
+			}
+			exitWith(exitUsage, &cliError{"usage", err.Error() + " (-h lists the flags)"})
+		}
+		args = fs.Args()
+		if !interleaved || len(args) == 0 {
+			return append(pos, args...)
+		}
+		pos, args = append(pos, args[0]), args[1:]
+	}
 }
 
 // reposFlags are the flags every command that walks a folder shares.
@@ -72,17 +114,23 @@ func reposFlags(fs *flag.FlagSet) (root *string, depth *int) {
 		fs.Int("depth", 4, "how many folders deep to look for repositories")
 }
 
-// parseInterleaved lets flags come after positional arguments, as in "where fix/login --repo api".
-func parseInterleaved(fs *flag.FlagSet, args []string) []string {
-	var pos []string
-	for {
-		fs.Parse(args)
-		args = fs.Args()
-		if len(args) == 0 {
-			return pos
-		}
-		pos, args = append(pos, args[0]), args[1:]
+func findRepos(root string, depth int) []string {
+	if _, err := os.Stat(root); err != nil {
+		exitWith(exitError, &cliError{"root_not_found", fmt.Sprintf("can't read %s: pass --root with the folder that holds your repositories", root)})
 	}
+	gitDirs, err := discover(root, depth)
+	if err != nil {
+		fatal(err)
+	}
+	return gitDirs
+}
+
+func mustLoadKeep(path string) keepList {
+	keep, err := loadKeep(path, home)
+	if err != nil {
+		exitWith(exitError, failure("keep_file_invalid", err))
+	}
+	return keep
 }
 
 func scanCmd(args []string) {
@@ -91,26 +139,16 @@ func scanCmd(args []string) {
 	jobs := fs.Int("jobs", 12, "repositories to scan at once")
 	noFetch := fs.Bool("no-fetch", false, "don't fetch remotes first (faster, may be stale)")
 	noGitHub := fs.Bool("no-github", false, "don't look up PRs, judge branches by git alone")
-	asJSON := fs.Bool("json", false, "print the full scan as JSON")
+	fs.Bool("json", false, "print the result as one JSON document (see AGENTS.md)")
 	verbose := fs.Bool("v", false, "list every kept branch and worktree")
 	noSizes := fs.Bool("no-sizes", false, "skip measuring the worktrees to be removed")
 	keepPath := fs.String("keep", defaultKeep, "keep list file")
 	planPath := fs.String("plan", defaultPlan, "where to save the plan that git-mop apply removes")
-	apply := fs.Bool("apply", false, "removed: run git-mop apply after reviewing the report")
-	fs.Parse(args)
-	if *apply {
-		fatal(fmt.Errorf("--apply is now a command: review the report, then run git-mop apply"))
-	}
+	parse(fs, args, false)
 
-	keep, err := loadKeep(*keepPath, home)
-	if err != nil {
-		fatal(err)
-	}
-	gitDirs, err := discover(*root, *depth)
-	if err != nil {
-		fatal(err)
-	}
-	fmt.Fprintf(os.Stderr, "scanning %d repositories...\n", len(gitDirs))
+	keep := mustLoadKeep(*keepPath)
+	gitDirs := findRepos(*root, *depth)
+	progress("scanning %s...", plural(len(gitDirs), "repository"))
 	opt := scanOptions{fetch: !*noFetch, cwds: processCwds(), keep: keep}
 	repos := make([]*Repo, len(gitDirs))
 	forEach(len(gitDirs), *jobs, func(i int) {
@@ -132,21 +170,37 @@ func scanCmd(args []string) {
 	}
 	keepNested(found)
 	p := buildPlan(found)
-	if err := savePlan(*planPath, *root, p); err != nil {
-		fatal(err)
-	}
-
-	if *asJSON {
-		printJSON(found)
-		return
+	created := time.Now()
+	if err := savePlan(*planPath, *root, created, p); err != nil {
+		exitWith(exitError, failure("plan_write_failed", err))
 	}
 	if !*noSizes {
 		measure(p.worktrees, *jobs)
 	}
-	printReport(os.Stdout, *root, found, p, *verbose)
-	if len(p.worktrees)+len(p.branches)+len(p.prune) > 0 {
-		fmt.Printf("\nnothing removed: run git-mop apply to remove the items under SAFE TO REMOVE\nplan: %s\n", *planPath)
+	d := buildScanDoc(*root, *planPath, created, found, p)
+	if jsonMode {
+		printJSON(d)
+		return
 	}
+	renderScan(os.Stdout, d, *verbose)
+}
+
+// applyDoc is what --json prints for apply.
+type applyDoc struct {
+	header
+	Plan    planInfo     `json:"plan"`
+	Root    string       `json:"root"`
+	Summary applySummary `json:"summary"`
+	Results []applied    `json:"results"`
+	LogPath string       `json:"logPath"`
+}
+
+type applySummary struct {
+	Removed int `json:"removed"` // worktrees
+	Deleted int `json:"deleted"` // branches
+	Pruned  int `json:"pruned"`  // stale worktree entries
+	Skipped int `json:"skipped"`
+	Failed  int `json:"failed"`
 }
 
 func applyCmd(args []string) {
@@ -155,32 +209,99 @@ func applyCmd(args []string) {
 	maxAge := fs.Duration("max-age", 24*time.Hour, "refuse a plan older than this (0 for no limit)")
 	keepPath := fs.String("keep", defaultKeep, "keep list file, for its ignorable patterns")
 	logPath := fs.String("log", defaultLog, "where to log what was removed")
-	asJSON := fs.Bool("json", false, "print what was removed and skipped as JSON")
-	fs.Parse(args)
+	only := fs.String("only", "", "comma-separated item ids from the scan's --json: remove only these, and keep the plan for the rest")
+	fs.Bool("json", false, "print the result as one JSON document (see AGENTS.md)")
+	parse(fs, args, false)
 
-	keep, err := loadKeep(*keepPath, home)
-	if err != nil {
-		fatal(err)
-	}
+	keep := mustLoadKeep(*keepPath)
 	sp, p, err := loadPlan(*planPath, *maxAge)
 	if err != nil {
 		fatal(err)
 	}
-	var out io.Writer = os.Stdout
-	if *asJSON {
-		out = io.Discard
-	} else {
-		fmt.Printf("applying the plan from %s (scan of %s)\n\n", sp.Created.Format("2 Jan 15:04"), sp.Root)
+	if *only != "" {
+		if p, err = p.only(strings.Split(*only, ",")); err != nil {
+			fatal(err)
+		}
 	}
-	res, err := applyPlan(out, p, *logPath, keep)
+	res, err := applyPlan(p, *logPath, keep)
 	if err != nil {
-		fatal(err)
+		exitWith(exitError, failure("log_write_failed", err))
 	}
-	// a plan is used once: the next apply needs a fresh scan and review
-	os.Remove(*planPath)
-	if *asJSON {
-		printJSON(res)
+	// a plan is used once, so the next full apply needs a fresh scan and review.
+	// --only leaves it for the items not yet applied, which were reviewed too.
+	if *only == "" {
+		os.Remove(*planPath)
 	}
+	d := applyDoc{header: okHeader(), Plan: planInfo{*planPath, sp.Created, sp.Created.Add(*maxAge)}, Root: sp.Root, Results: res, LogPath: *logPath}
+	for _, a := range res {
+		switch a.Outcome {
+		case "removed":
+			d.Summary.Removed++
+		case "deleted":
+			d.Summary.Deleted++
+		case "pruned":
+			d.Summary.Pruned += a.Pruned
+		case "skipped":
+			d.Summary.Skipped++
+		case "failed":
+			d.Summary.Failed++
+		}
+	}
+	if jsonMode {
+		printJSON(d)
+		return
+	}
+	renderApply(os.Stdout, d)
+}
+
+func renderApply(w io.Writer, d applyDoc) {
+	s := outStyle
+	fmt.Fprintf(w, "%s  %s\n\n", s.bold("git-mop apply"), s.dim("plan from "+d.Plan.CreatedAt.Format("Mon 2 Jan 15:04")+", scan of "+tildify(d.Root)))
+	if len(d.Results) == 0 {
+		fmt.Fprintln(w, s.dim("  The plan had nothing to remove."))
+		return
+	}
+	var t table
+	for _, a := range d.Results {
+		mark, paint := "✓", s.green
+		switch a.Outcome {
+		case "skipped":
+			mark, paint = "–", s.yellow
+		case "failed":
+			mark, paint = "✗", s.red
+		}
+		what, detail := a.Branch, ""
+		switch a.Kind {
+		case "worktree":
+			what = relTo(d.Root, a.Path)
+		case "stale_worktree":
+			what = a.Repo
+			if a.Outcome == "pruned" {
+				detail = plural(a.Pruned, "stale entry")
+			}
+		}
+		if a.Reason != nil {
+			detail = a.Reason.Text
+		}
+		kind := a.Kind
+		if kind == "stale_worktree" {
+			kind = "stale"
+		}
+		repo := a.Repo
+		if a.Kind == "stale_worktree" {
+			repo = ""
+		}
+		t.add(c(mark, paint), c(a.Outcome, paint), c(kind, s.dim), c(repo, s.cyan), c(what, s.plain), c(detail, s.dim))
+	}
+	t.render(w, "  ")
+	sum := d.Summary
+	fmt.Fprintf(w, "\n  %s    %s    %s    %s    %s\n  %s\n",
+		paintIf(sum.Removed > 0, s.green, s.dim)(plural(sum.Removed, "worktree")+" removed"),
+		paintIf(sum.Deleted > 0, s.green, s.dim)(plural(sum.Deleted, "branch")+" deleted"),
+		paintIf(sum.Pruned > 0, s.green, s.dim)(plural(sum.Pruned, "stale entry")+" pruned"),
+		paintIf(sum.Skipped > 0, s.yellow, s.dim)(fmt.Sprintf("%d skipped", sum.Skipped)),
+		paintIf(sum.Failed > 0, s.red, s.dim)(fmt.Sprintf("%d failed", sum.Failed)),
+		s.dim("Every removal is logged with its SHA in "+tildify(d.LogPath)+": git branch <name> <sha> brings a branch back."))
 }
 
 func syncCmd(args []string) {
@@ -190,34 +311,47 @@ func syncCmd(args []string) {
 	noFetch := fs.Bool("no-fetch", false, "fast-forward to the remote branches as last fetched")
 	dryRun := fs.Bool("dry-run", false, "fetch and report what would move, without moving anything")
 	includeOpen := fs.Bool("include-open", false, "also update worktrees a process has open, such as a dev server")
-	asJSON := fs.Bool("json", false, "print the results as JSON")
-	fs.Parse(args)
+	fs.Bool("json", false, "print the result as one JSON document (see AGENTS.md)")
+	parse(fs, args, false)
 
-	gitDirs, err := discover(*root, *depth)
-	if err != nil {
-		fatal(err)
-	}
-	fmt.Fprintf(os.Stderr, "syncing %d repositories...\n", len(gitDirs))
+	gitDirs := findRepos(*root, *depth)
+	progress("syncing %s...", plural(len(gitDirs), "repository"))
 	cwds := processCwds()
 	reports := make([]syncReport, len(gitDirs))
 	results := make([][]synced, len(gitDirs))
 	forEach(len(gitDirs), *jobs, func(i int) {
 		results[i] = syncRepo(gitDirs[i], !*noFetch, *includeOpen, *dryRun, cwds, &reports[i])
 	})
-	rep := syncReport{Repos: len(gitDirs), DryRun: *dryRun, Results: []synced{}, FetchFailed: []string{}}
+	rep := syncReport{header: okHeader(), DryRun: *dryRun, Results: []synced{}, FetchFailed: []fetchFailure{}}
+	rep.Summary.Repos = len(gitDirs)
 	for i := range gitDirs {
 		rep.Results = append(rep.Results, results[i]...)
 		rep.FetchFailed = append(rep.FetchFailed, reports[i].FetchFailed...)
-		rep.UpToDate += reports[i].UpToDate
-		rep.NoUpstream += reports[i].NoUpstream
-		rep.OtherUpstream += reports[i].OtherUpstream
-		rep.DetachedWTs += reports[i].DetachedWTs
+		rep.Summary.UpToDate += reports[i].Summary.UpToDate
+		rep.Summary.NoUpstream += reports[i].Summary.NoUpstream
+		rep.Summary.OtherUpstream += reports[i].Summary.OtherUpstream
+		rep.Summary.DetachedWTs += reports[i].Summary.DetachedWTs
 	}
-	if *asJSON {
+	for _, s := range rep.Results {
+		if s.Action == "skipped" {
+			rep.Summary.Skipped++
+		} else {
+			rep.Summary.Updated++
+		}
+	}
+	rep.Summary.FetchFailed = len(rep.FetchFailed)
+	if jsonMode {
 		printJSON(rep)
 		return
 	}
-	printSync(os.Stdout, rep)
+	renderSync(os.Stdout, rep)
+}
+
+// whereDoc is what --json prints for where.
+type whereDoc struct {
+	header
+	Pattern string  `json:"pattern"`
+	Matches []found `json:"matches"`
 }
 
 func whereCmd(args []string) {
@@ -225,17 +359,12 @@ func whereCmd(args []string) {
 	root, depth := reposFlags(fs)
 	repo := fs.String("repo", "", "only look in the repository with this name, such as api")
 	pathOnly := fs.Bool("path", false, "print only worktree paths, one per line, for cd $(git-mop where ...)")
-	asJSON := fs.Bool("json", false, "print the results as JSON")
-	pos := parseInterleaved(fs, args)
+	fs.Bool("json", false, "print the result as one JSON document (see AGENTS.md)")
+	pos := parse(fs, args, true)
 	if len(pos) != 1 {
-		fs.Usage()
-		os.Exit(2)
+		exitWith(exitUsage, &cliError{"usage", "where takes one branch name or glob, such as git-mop where 'fix/*'"})
 	}
-	gitDirs, err := discover(*root, *depth)
-	if err != nil {
-		fatal(err)
-	}
-	res := where(gitDirs, pos[0], *repo)
+	res := where(findRepos(*root, *depth), pos[0], *repo)
 	inWorktree := 0
 	for _, f := range res {
 		if f.Path != "" {
@@ -243,11 +372,8 @@ func whereCmd(args []string) {
 		}
 	}
 	switch {
-	case *asJSON:
-		if res == nil {
-			res = []found{}
-		}
-		printJSON(res)
+	case jsonMode:
+		printJSON(whereDoc{okHeader(), pos[0], append([]found{}, res...)})
 	case *pathOnly:
 		for _, f := range res {
 			if f.Path != "" {
@@ -255,40 +381,41 @@ func whereCmd(args []string) {
 			}
 		}
 	default:
-		printWhere(res)
+		renderWhere(os.Stdout, pos[0], res)
 	}
 	if inWorktree == 0 {
-		os.Exit(1)
+		os.Exit(exitNotFound)
 	}
 }
 
-func printWhere(res []found) {
+func renderWhere(w io.Writer, pattern string, res []found) {
+	s := outStyle
 	if len(res) == 0 {
-		fmt.Fprintln(os.Stderr, "no branch matches")
+		fmt.Fprintf(os.Stderr, "%s\n", errStyle.dim("no branch matches "+pattern))
 		return
 	}
+	var t table
 	for _, f := range res {
-		state := "clean"
-		switch {
-		case f.Path == "":
-			fmt.Printf("%s\t%s\tnot checked out\n", f.Repo, f.Branch)
-			continue
-		case f.Dirty < 0:
-			state = "status unreadable"
-		case f.Dirty > 0:
-			state = plural(f.Dirty, "uncommitted change")
+		mark, paint, loc := "●", s.green, tildify(f.Path)
+		switch f.State {
+		case "not_checked_out":
+			mark, paint, loc = "○", s.dim, ""
+		case "uncommitted_changes", "status_unreadable":
+			paint = s.yellow
 		}
+		state := f.StateText
 		if f.Main {
 			state += ", main checkout"
 		}
-		fmt.Printf("%s\t%s\t%s\t%s\n", f.Repo, f.Branch, f.Path, state)
+		t.add(c(mark, paint), c(f.Repo, s.cyan), c(f.Branch, s.bold), c(state, paint), c(loc, s.dim))
 	}
+	t.render(w, "")
 }
 
 // forEach runs fn for 0..n-1 with at most jobs running at once.
 func forEach(n, jobs int, fn func(i int)) {
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, jobs)
+	sem := make(chan struct{}, max(jobs, 1))
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		sem <- struct{}{}
@@ -299,67 +426,4 @@ func forEach(n, jobs int, fn func(i int)) {
 		}(i)
 	}
 	wg.Wait()
-}
-
-func printJSON(v any) {
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(v); err != nil {
-		fatal(err)
-	}
-}
-
-// loadKeep reads the keep list: "<repo name> <branch>" per line, "path <folder>" to keep a worktree
-// or everything under a folder, "throwaway <repo name> <glob>" for branches whose local-only
-// commits don't need keeping, "ignorable <glob>" for ignored files that are fine to lose with
-// a worktree, or "longlived <branch>" for a branch that PRs merge into and that is never deleted.
-// Lines starting with # are comments.
-func loadKeep(path, home string) (keepList, error) {
-	k := keepList{branches: map[string]bool{}, longLived: map[string]bool{}}
-	f, err := os.Open(path)
-	if os.IsNotExist(err) {
-		return k, nil
-	}
-	if err != nil {
-		return k, err
-	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		l := strings.TrimSpace(sc.Text())
-		if l == "" || strings.HasPrefix(l, "#") {
-			continue
-		}
-		fields := strings.Fields(l)
-		if len(fields) == 3 && fields[0] == "throwaway" {
-			k.throwaway = append(k.throwaway, fields[1]+" "+fields[2])
-			continue
-		}
-		if len(fields) != 2 {
-			return k, fmt.Errorf("%s: want \"<repo> <branch>\", \"path <folder>\", \"throwaway <repo> <glob>\", \"ignorable <glob>\" or \"longlived <branch>\", got %q", path, l)
-		}
-		if fields[0] == "ignorable" {
-			k.ignorable = append(k.ignorable, fields[1])
-			continue
-		}
-		if fields[0] == "longlived" {
-			k.longLived[fields[1]] = true
-			continue
-		}
-		if fields[0] == "path" {
-			p := fields[1]
-			if strings.HasPrefix(p, "~/") {
-				p = filepath.Join(home, p[2:])
-			}
-			k.paths = append(k.paths, filepath.Clean(p))
-			continue
-		}
-		k.branches[fields[0]+" "+fields[1]] = true
-	}
-	return k, sc.Err()
-}
-
-func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "git-mop:", err)
-	os.Exit(1)
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +20,7 @@ func TestApplyRemovesOnlyWhatThePlanListed(t *testing.T) {
 	root, clone := fixture(t)
 	_, p := scanFixture(t, clone, keepList{})
 	planPath := filepath.Join(root, "plan.json")
-	if err := savePlan(planPath, root, p); err != nil {
+	if err := savePlan(planPath, root, time.Now(), p); err != nil {
 		t.Fatal(err)
 	}
 
@@ -34,12 +33,12 @@ func TestApplyRemovesOnlyWhatThePlanListed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var out bytes.Buffer
-	if _, err := applyPlan(&out, loaded, filepath.Join(root, "removed.log"), keepList{}); err != nil {
+	res, err := applyPlan(loaded, filepath.Join(root, "removed.log"), keepList{})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(root, "dev", "shop-merged")); !os.IsNotExist(err) {
-		t.Errorf("want the reviewed worktree removed, output:\n%s", out.String())
+		t.Errorf("want the reviewed worktree removed, results: %+v", res)
 	}
 	if _, err := os.Stat(late); err != nil {
 		t.Errorf("a worktree that wasn't in the reviewed plan must survive: %v", err)
@@ -83,11 +82,30 @@ func TestIgnoredFilesThatCantBeRebuiltBlockRemoval(t *testing.T) {
 	_, p := scanFixture(t, clone, keepList{ignorable: []string{".env"}})
 	os.MkdirAll(filepath.Join(merged, "notes"), 0o755)
 	os.WriteFile(filepath.Join(merged, "notes", "plan.md"), []byte("x"), 0o644)
-	var out bytes.Buffer
-	if _, err := applyPlan(&out, p, filepath.Join(root, "removed.log"), keepList{ignorable: []string{".env"}}); err != nil {
+	res, err := applyPlan(p, filepath.Join(root, "removed.log"), keepList{ignorable: []string{".env"}})
+	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(filepath.Join(merged, "notes", "plan.md")); err != nil {
-		t.Errorf("notes added after the scan must survive apply, output:\n%s", out.String())
+		t.Errorf("notes added after the scan must survive apply, results: %+v", res)
+	}
+}
+
+// The plan and the removal log list every repository path and branch name, so only their owner reads them.
+func TestPlanAndLogAreOnlyReadableByTheirOwner(t *testing.T) {
+	root, clone := fixture(t)
+	_, p := scanFixture(t, clone, keepList{})
+	state := filepath.Join(root, "state")
+	planPath, logPath := filepath.Join(state, "plan.json"), filepath.Join(state, "removed.log")
+	if err := savePlan(planPath, root, time.Now(), p); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := applyPlan(p, logPath, keepList{}); err != nil {
+		t.Fatal(err)
+	}
+	for path, want := range map[string]os.FileMode{state: 0o700 | os.ModeDir, planPath: 0o600, logPath: 0o600} {
+		if fi, err := os.Stat(path); err != nil || fi.Mode() != want {
+			t.Errorf("%s: want mode %v, got %v (%v)", filepath.Base(path), want, fi.Mode(), err)
+		}
 	}
 }

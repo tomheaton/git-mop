@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -90,7 +91,7 @@ func scanWorktrees(r *Repo, opt scanOptions) []*Worktree {
 			w.Prunable = true
 			continue
 		}
-		if st, err := gitIn(w.Path, "status", "--porcelain"); err == nil {
+		if st, err := statusIn(w.Path); err == nil {
 			w.Dirty = len(lines(st))
 		} else {
 			w.Dirty = -1 // unreadable counts as dirty
@@ -98,6 +99,7 @@ func scanWorktrees(r *Repo, opt scanOptions) []*Worktree {
 		w.InUse = usersOf(w.Path, opt.cwds)
 		if !w.Main {
 			w.Ignored = valuableIgnored(w.Path, opt.keep)
+			w.SubmoduleWork = submoduleWork(w.Path, opt.keep)
 		}
 		if w.Branch == "" && w.Head != "" {
 			w.HeadInDefault = gitOK(r.GitDir, "merge-base", "--is-ancestor", w.Head, r.Default)
@@ -161,6 +163,46 @@ func squashed(gitDir, def, tip string) bool {
 	return err == nil && strings.HasPrefix(out, "-")
 }
 
+// submoduleWork describes what removing a linked worktree would lose inside its submodules that
+// git status doesn't show: commits on no remote branch (including stashes) and ignored files nothing
+// rebuilds. git keeps a linked worktree's submodule repositories inside the worktree's own git dir,
+// so they go with it. Anything it can't check counts as work.
+func submoduleWork(dir string, keep keepList) string {
+	out, err := gitIn(dir, "submodule", "status", "--recursive")
+	if err != nil {
+		return "couldn't list its submodules: " + firstLine(err.Error())
+	}
+	var found []string
+	for _, l := range lines(out) {
+		// "<state><sha> <path>" with an optional " (<describe>)". run trims the output, so the first
+		// line can lose a " " state. State "-" is a submodule never checked out: nothing on disk to lose.
+		state := byte(' ')
+		if l != "" && strings.IndexByte(" +-U", l[0]) >= 0 {
+			state, l = l[0], l[1:]
+		}
+		_, path, ok := strings.Cut(l, " ")
+		if !ok || state == '-' {
+			continue
+		}
+		if i := strings.LastIndex(path, " ("); i >= 0 && strings.HasSuffix(path, ")") {
+			path = path[:i]
+		}
+		sub := filepath.Join(dir, path)
+		n, err := gitIn(sub, "rev-list", "--count", "--all", "--not", "--remotes")
+		switch {
+		case err != nil:
+			found = append(found, path+" couldn't be checked")
+		case n != "0":
+			c, _ := strconv.Atoi(n)
+			found = append(found, path+" has "+plural(c, "commit")+" on no remote branch")
+		}
+		if ig := valuableIgnored(sub, keep); len(ig) > 0 {
+			found = append(found, path+" has ignored "+describeIgnored(ig))
+		}
+	}
+	return strings.Join(found, "; ")
+}
+
 func usersOf(path string, cwds map[string][]string) []string {
 	var users []string
 	for dir, cmds := range cwds {
@@ -176,11 +218,11 @@ func usersOf(path string, cwds map[string][]string) []string {
 // rather than carry on. lsof exits non-zero when it can't read some processes, which is fine.
 func processCwds() map[string][]string {
 	if _, err := exec.LookPath("lsof"); err != nil {
-		fatal(fmt.Errorf("lsof is needed to check that no process is working inside a worktree: %w", err))
+		exitWith(exitError, &cliError{"lsof_missing", "lsof is needed to check that no process is working inside a worktree: " + err.Error()})
 	}
 	out, err := run("lsof", "-a", "-d", "cwd", "-Fpcn")
 	if out == "" {
-		fatal(fmt.Errorf("lsof listed no processes, so it can't check which worktrees are in use: %v", err))
+		exitWith(exitError, &cliError{"lsof_failed", fmt.Sprintf("lsof listed no processes, so it can't check which worktrees are in use: %v", err)})
 	}
 	m := map[string][]string{}
 	self := strconv.Itoa(os.Getpid())

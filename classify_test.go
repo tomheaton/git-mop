@@ -45,15 +45,19 @@ func TestClassifyBranch(t *testing.T) {
 			if got.Action != c.want {
 				t.Fatalf("got %s (%s), want %s", got.Action, got.Reason, c.want)
 			}
+			// scripts and agents branch on the code, so every verdict carries one
+			if got.Code == "" {
+				t.Errorf("verdict %q has no reason code", got.Reason)
+			}
 		})
 	}
 }
 
 // A worktree inside another linked worktree that stays would change that parent if removed.
 func TestNestedWorktreeFollowsItsParent(t *testing.T) {
-	parent := &Worktree{Path: "/dev/claude/wt", Verdict: Verdict{Keep, "dirty"}}
-	child := &Worktree{Path: "/dev/claude/wt/sub", Verdict: Verdict{Safe, "in default"}}
-	sibling := &Worktree{Path: "/dev/claude/wt-other", Verdict: Verdict{Safe, "in default"}}
+	parent := &Worktree{Path: "/dev/claude/wt", Verdict: Verdict{Action: Keep, Reason: "dirty"}}
+	child := &Worktree{Path: "/dev/claude/wt/sub", Verdict: Verdict{Action: Safe, Reason: "in default"}}
+	sibling := &Worktree{Path: "/dev/claude/wt-other", Verdict: Verdict{Action: Safe, Reason: "in default"}}
 	keepNested([]*Repo{{Worktrees: []*Worktree{{Main: true, Path: "/dev"}, parent}}, {Worktrees: []*Worktree{{Main: true}, child, sibling}}})
 	if child.Verdict.Action != Keep {
 		t.Errorf("child of a kept worktree: got %s, want keep", child.Verdict.Action)
@@ -76,8 +80,12 @@ func TestClassifyDetached(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			if got := classifyDetached(testRepo(), &c.w, keepList{}); got.Action != c.want {
+			got := classifyDetached(testRepo(), &c.w, keepList{})
+			if got.Action != c.want {
 				t.Fatalf("got %s (%s), want %s", got.Action, got.Reason, c.want)
+			}
+			if got.Code == "" {
+				t.Errorf("verdict %q has no reason code", got.Reason)
 			}
 		})
 	}

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -81,6 +80,16 @@ func fixture(t *testing.T) (root, clone string) {
 	return root, clone
 }
 
+// result finds what apply did with one item, by its id.
+func result(res []applied, id string) applied {
+	for _, a := range res {
+		if a.ID == id {
+			return a
+		}
+	}
+	return applied{}
+}
+
 func verdicts(r *Repo) map[string]Action {
 	m := map[string]Action{}
 	for _, b := range r.Branches {
@@ -127,15 +136,15 @@ func TestApplySkipsAnythingThatChangedSinceTheScan(t *testing.T) {
 	commit(t, clone, "late")
 	sh(t, clone, "switch", "-q", "master")
 
-	var out bytes.Buffer
-	if _, err := applyPlan(&out, p, filepath.Join(root, "removed.log"), keepList{}); err != nil {
+	res, err := applyPlan(p, filepath.Join(root, "removed.log"), keepList{})
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "skip shop done: new commits since the scan") {
-		t.Errorf("want the moved branch skipped, got:\n%s", out.String())
+	if got := result(res, branchID(r, "done")); got.Outcome != "skipped" || got.Reason == nil || got.Reason.Code != "branch_moved" {
+		t.Errorf("want the moved branch skipped as branch_moved, got %+v", got)
 	}
-	if !strings.Contains(out.String(), "pruned 1 stale entry") {
-		t.Errorf("want the deleted worktree folder pruned, got:\n%s", out.String())
+	if got := result(res, pruneID(r)); got.Outcome != "pruned" || got.Pruned != 1 {
+		t.Errorf("want the deleted worktree folder pruned, got %+v", got)
 	}
 	if _, err := os.Stat(filepath.Join(root, "dev", "shop-merged")); !os.IsNotExist(err) {
 		t.Errorf("want the clean merged worktree removed")
@@ -149,5 +158,29 @@ func TestApplySkipsAnythingThatChangedSinceTheScan(t *testing.T) {
 	log, _ := os.ReadFile(filepath.Join(root, "removed.log"))
 	if !strings.Contains(string(log), "merged-wt") {
 		t.Errorf("want the removal logged with its SHA, log:\n%s", log)
+	}
+}
+
+// A repository's own config can name programs for git to run. Scanning and applying run git in
+// every repository under the root, so neither may run them: not an fsmonitor, not a hook.
+func TestScanAndApplyRunNoProgramsFromRepositoryConfig(t *testing.T) {
+	root, clone := fixture(t)
+	marker := filepath.Join(root, "ran")
+	script := filepath.Join(root, "evil.sh")
+	os.WriteFile(script, []byte("#!/bin/sh\necho \"$0 $1\" >> \""+marker+"\"\n"), 0o755)
+	sh(t, clone, "config", "core.fsmonitor", script)
+	hooks := filepath.Join(clone, ".git", "hooks")
+	os.MkdirAll(hooks, 0o755)
+	for _, h := range []string{"reference-transaction", "post-merge", "post-checkout"} {
+		os.Symlink(script, filepath.Join(hooks, h))
+	}
+
+	r := scanRepo(filepath.Join(clone, ".git"), scanOptions{})
+	classify(r, keepList{})
+	if _, err := applyPlan(buildPlan([]*Repo{r}), filepath.Join(root, "removed.log"), keepList{}); err != nil {
+		t.Fatal(err)
+	}
+	if ran, err := os.ReadFile(marker); err == nil {
+		t.Errorf("want nothing from the repository's config run, ran:\n%s", ran)
 	}
 }

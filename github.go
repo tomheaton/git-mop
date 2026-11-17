@@ -12,18 +12,21 @@ import (
 const graphqlBatch = 40
 
 type prNode struct {
-	Number      int       `json:"number"`
-	State       string    `json:"state"`
-	BaseRefName string    `json:"baseRefName"`
-	HeadRefOid  string    `json:"headRefOid"`
-	MergedAt    time.Time `json:"mergedAt"`
-	URL         string    `json:"url"`
-	Author      struct {
+	Number int    `json:"number"`
+	State  string `json:"state"`
+	// opened from a fork: its branch name can match a local branch without having anything to do with it
+	IsCrossRepository bool      `json:"isCrossRepository"`
+	BaseRefName       string    `json:"baseRefName"`
+	HeadRefOid        string    `json:"headRefOid"`
+	MergedAt          time.Time `json:"mergedAt"`
+	URL               string    `json:"url"`
+	Author            struct {
 		Login string `json:"login"`
 	} `json:"author"`
 }
 
-// lookupPRs returns, for each head branch name, every PR opened from it, newest first.
+// lookupPRs returns, for each head branch name, every PR opened from that branch of the repository
+// itself, newest first. PRs from forks with the same branch name are left out.
 func lookupPRs(slug string, heads []string) (map[string][]PR, error) {
 	parts := strings.SplitN(slug, "/", 2)
 	if len(parts) != 2 {
@@ -35,7 +38,7 @@ func lookupPRs(slug string, heads []string) (map[string][]PR, error) {
 		var q strings.Builder
 		fmt.Fprintf(&q, "query { repository(owner: %s, name: %s) {", strconv.Quote(parts[0]), strconv.Quote(parts[1]))
 		for i, h := range heads[start:end] {
-			fmt.Fprintf(&q, " b%d: pullRequests(headRefName: %s, first: 10, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number state baseRefName headRefOid mergedAt url author { login } } }", i, strconv.Quote(h))
+			fmt.Fprintf(&q, " b%d: pullRequests(headRefName: %s, first: 10, orderBy: {field: CREATED_AT, direction: DESC}) { nodes { number state isCrossRepository baseRefName headRefOid mergedAt url author { login } } }", i, strconv.Quote(h))
 		}
 		q.WriteString(" } }")
 		out, err := run("gh", "api", "graphql", "-f", "query="+q.String())
@@ -56,6 +59,9 @@ func lookupPRs(slug string, heads []string) (map[string][]PR, error) {
 		}
 		for i, h := range heads[start:end] {
 			for _, n := range body.Data.Repository["b"+strconv.Itoa(i)].Nodes {
+				if n.IsCrossRepository {
+					continue
+				}
 				res[h] = append(res[h], PR{Number: n.Number, State: n.State, Base: n.BaseRefName, HeadOid: n.HeadRefOid, Author: n.Author.Login, URL: n.URL, MergedAt: n.MergedAt})
 			}
 		}
