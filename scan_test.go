@@ -161,6 +161,42 @@ func TestApplySkipsAnythingThatChangedSinceTheScan(t *testing.T) {
 	}
 }
 
+// Before deleting a branch, apply asks git which worktrees have it checked out. If git can't
+// answer, apply can't tell, so the branch must stay.
+func TestApplyKeepsABranchWhenItCannotListWorktrees(t *testing.T) {
+	root, clone := fixture(t)
+	r := scanRepo(filepath.Join(clone, ".git"), scanOptions{})
+	classify(r, keepList{})
+	p, err := buildPlan([]*Repo{r}).only([]string{branchID(r, "done")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// after the scan, someone checks the branch out, and then git fails to list worktrees
+	sh(t, clone, "worktree", "add", "-q", filepath.Join(root, "dev", "shop-done"), "done")
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := t.TempDir()
+	fake := "#!/bin/sh\nprev=\nfor a in \"$@\"; do\n" +
+		"  if [ \"$prev\" = worktree ] && [ \"$a\" = list ]; then echo 'fatal: cannot list worktrees' >&2; exit 128; fi\n" +
+		"  prev=$a\ndone\nexec \"" + realGit + "\" \"$@\"\n"
+	os.WriteFile(filepath.Join(bin, "git"), []byte(fake), 0o755)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	res, err := applyPlan(p, filepath.Join(root, "removed.log"), keepList{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := result(res, branchID(r, "done")); got.Outcome != "failed" || got.Reason == nil || got.Reason.Code != "git_failed" {
+		t.Errorf("want the branch left alone as git_failed, got %+v", got)
+	}
+	if !gitOK(r.GitDir, "rev-parse", "-q", "--verify", "refs/heads/done") {
+		t.Errorf("the branch checked out in a worktree must survive")
+	}
+}
+
 // A repository's own config can name programs for git to run. Scanning and applying run git in
 // every repository under the root, so neither may run them: not an fsmonitor, not a hook.
 func TestScanAndApplyRunNoProgramsFromRepositoryConfig(t *testing.T) {

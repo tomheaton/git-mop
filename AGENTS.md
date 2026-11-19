@@ -16,7 +16,7 @@ It's one Go package, `main`, at the repository root. That's the standard layout 
 
 | File | What it owns |
 | --- | --- |
-| `main.go` | Command dispatch, flags, the apply/sync/where documents and their renderers |
+| `main.go` | Command dispatch, flags, the apply and where documents and their renderers |
 | `discover.go` | Finding repositories under the root |
 | `scan.go` | Reading each repository: worktrees, branches, submodule work, `lsof` |
 | `github.go` | PR lookups through `gh api graphql` |
@@ -65,7 +65,7 @@ CI runs `gofmt`, `go vet` and `go test` on Ubuntu and macOS (`.github/workflows/
 
 - Adding a field or a reason code: fine at any time. Add new codes to the tables below.
 - Removing or renaming a field, or changing what a field or code means: bump `schemaVersion` in `output.go` and say so in the commit message.
-- Every verdict needs a code. `classify_test.go` fails on a verdict without one.
+- Every verdict needs a code. The table tests in `classify_test.go` check that each case has one, so add a case for every new verdict.
 
 ## Running git-mop as an agent
 

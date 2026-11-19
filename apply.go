@@ -154,7 +154,11 @@ func deleteBranch(it item, record func(kind, gitDir, name, sha string)) applied 
 	if tip != b.Tip {
 		return a.skipped(&Reason{"branch_moved", "new commits since the scan"})
 	}
-	out, _ := git(r.GitDir, "worktree", "list", "--porcelain")
+	// without the list there's no telling whether a worktree has the branch checked out, so it stays
+	out, err := git(r.GitDir, "worktree", "list", "--porcelain")
+	if err != nil {
+		return a.failed(err)
+	}
 	for _, l := range lines(out) {
 		if l == "branch refs/heads/"+b.Name {
 			return a.skipped(&Reason{"checked_out", "checked out in a worktree"})
